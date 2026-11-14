@@ -1,9 +1,79 @@
 import { getFlags } from "./env";
-import { sharedRelationships } from "./extract";
-import { extractWithGemini, transcribeAudio } from "./gemini";
-import { getStore } from "./store";
-import type { CaptureResult, Memory, Transcript } from "./types";
+import { heuristicExtractFromTranscript, sharedRelationships } from "./extract";
+import { extractWithGemini, transcribeAudio, type ExtractedPayload } from "./gemini";
+import { getStore, type DomainStore } from "./store";
+import type { ActionItem, CaptureResult, Memory, Transcript } from "./types";
 import { isoAt, nowTime, todayISO, truncate, uid } from "./util";
+
+async function applyExtractionToMemory(
+  store: DomainStore,
+  target: Memory,
+  ai: ExtractedPayload,
+  others: Memory[],
+  sourceLabel: string
+): Promise<{ updated: Memory; suggestedActions: ActionItem[] }> {
+  const updated =
+    (await store.updateMemory(target.id, {
+      title: ai.title || target.title,
+      summary: ai.summary || target.summary,
+      category: ai.category,
+      topics: ai.topics,
+      people: ai.people,
+      entities: ai.entities,
+      tone: ai.tone,
+      goals: ai.goals,
+      commitments: ai.commitments,
+      problems: ai.problems,
+      decisions: ai.decisions,
+      followUps: ai.followUps,
+      confidence: ai.confidence,
+      extractionStatus: "analyzed",
+      extractionError: null,
+    })) || target;
+
+  const suggestedActions: ActionItem[] = [];
+  if (!ai.empty) {
+    await store.addRelationships(sharedRelationships(updated, others, 3));
+
+    if (ai.goals.length > 0) {
+      const existingGoals = await store.listGoals(false);
+      const have = new Set(existingGoals.map((g) => g.title.trim().toLowerCase()));
+      for (const gTitle of ai.goals.slice(0, 4)) {
+        const clean = truncate(gTitle.trim(), 120);
+        if (!clean || have.has(clean.toLowerCase())) continue;
+        have.add(clean.toLowerCase());
+        await store.addGoal({
+          id: uid("goal"),
+          userId: store.userId,
+          title: clean,
+          status: "active",
+          sourceMemoryId: target.id,
+          createdAt: target.createdAt,
+          isDemo: false,
+        });
+      }
+    }
+
+    for (const c of ai.commitments.slice(0, 3)) {
+      const action = await store.addAction({
+        id: uid("act"),
+        userId: store.userId,
+        memoryId: target.id,
+        title: truncate(c, 90),
+        detail: `Suggested from your ${sourceLabel}: "${truncate(c, 120)}"`,
+        dueDate: null,
+        status: "suggested",
+        source: "memory",
+        createdAt: target.createdAt,
+        completedAt: null,
+        isDemo: false,
+      });
+      suggestedActions.push(action);
+    }
+  }
+
+  return { updated, suggestedActions };
+}
 
 export async function createMemoryFromTranscript(input: {
   transcript: string;
@@ -77,149 +147,103 @@ export async function createMemoryFromTranscript(input: {
   }
 
   const saved = await store.addMemory(memory);
+  const recent = await store.listMemories({ demoMode: false, limit: 40 });
+  const others = recent.filter((m) => m.id !== saved.id && !m.isDemo);
 
-  if (!flags.gemini) {
-    const err = await store.updateMemory(saved.id, {
-      extractionStatus: "pending",
-      extractionError:
-        "Gemini is not configured. The transcript is saved verbatim; AI extraction is waiting for GEMINI_API_KEY.",
-    });
-    warnings.push(
-      "No GEMINI_API_KEY configured — the transcript was saved exactly as captured, but no AI extraction ran. Nothing was inferred or invented."
-    );
-    return {
-      memory: err || saved,
-      extracted: [],
-      suggestedActions: [],
-      status: "pending",
-      message: "Saved your words verbatim. AI analysis will unlock once GEMINI_API_KEY is set.",
-      warnings,
-      transcriptProvider: input.transcriptProvider,
-    };
+  let ai: ExtractedPayload | null = null;
+  if (flags.gemini) {
+    try {
+      ai = await extractWithGemini(
+        transcript,
+        others.slice(0, 8).map((m) => m.title)
+      );
+    } catch {
+      ai = null;
+    }
   }
 
-  try {
-    const recent = await store.listMemories({ limit: 10 });
-    const ai = await extractWithGemini(
-      transcript,
-      recent.filter((m) => m.id !== saved.id).map((m) => m.title)
-    );
-    if (!ai) {
-      const err = await store.updateMemory(saved.id, {
-        extractionStatus: "failed",
-        extractionError: "Gemini returned an invalid response. The transcript is preserved unchanged.",
-      });
-      warnings.push("AI extraction failed — the transcript is saved but no structured memory was created.");
-      return {
-        memory: err || saved,
-        extracted: [],
-        suggestedActions: [],
-        status: "failed",
-        message: "The AI could not analyze this transcript — your words are preserved and can be deleted.",
-        warnings,
-        transcriptProvider: input.transcriptProvider,
-      };
-    }
-
-    const updated = await store.updateMemory(saved.id, {
-      title: ai.title,
-      summary: ai.summary,
-      category: ai.category,
-      topics: ai.topics,
-      people: ai.people,
-      entities: ai.entities,
-      tone: ai.tone,
-      goals: ai.goals,
-      commitments: ai.commitments,
-      problems: ai.problems,
-      decisions: ai.decisions,
-      followUps: ai.followUps,
-      confidence: ai.confidence,
-      extractionStatus: "analyzed",
-      extractionError: null,
-    });
-
-    if (!ai.empty) {
-      const all = await store.listMemories({ demoMode: false, limit: 40 });
-      const others = all.filter((m) => m.id !== saved.id && !m.isDemo);
-      await store.addRelationships(sharedRelationships(updated || saved, others, 3));
-
-      if (ai.goals.length > 0) {
-        const existingGoals = await store.listGoals(false);
-        const have = new Set(existingGoals.map((g) => g.title.trim().toLowerCase()));
-        for (const gTitle of ai.goals.slice(0, 4)) {
-          const clean = truncate(gTitle.trim(), 120);
-          if (!clean || have.has(clean.toLowerCase())) continue;
-          have.add(clean.toLowerCase());
-          await store.addGoal({
-            id: uid("goal"),
-            userId: store.userId,
-            title: clean,
-            status: "active",
-            sourceMemoryId: saved.id,
-            createdAt: saved.createdAt,
-            isDemo: false,
-          });
-        }
-      }
-
-      const suggestedActions = [];
-      for (const c of ai.commitments.slice(0, 3)) {
-        const action = await store.addAction({
-          id: uid("act"),
-          userId: store.userId,
-          memoryId: saved.id,
-          title: truncate(c, 90),
-          detail: `Suggested from your ${input.source === "voice" ? "voice capture" : "entry"}: "${truncate(c, 120)}"`,
-          dueDate: null,
-          status: "suggested",
-          source: "memory",
-          createdAt: saved.createdAt,
-          completedAt: null,
-          isDemo: false,
-        });
-        suggestedActions.push(action);
-      }
-      return {
-        memory: updated || saved,
-        extracted: [updated || saved],
-        suggestedActions,
-        status: "analyzed",
-        message: `Extracted ${ai.topics.length > 0 ? `topics ${ai.topics.slice(0, 3).join(", ")}` : "a structured memory"} from your words.`,
-        warnings,
-        transcriptProvider: input.transcriptProvider,
-      };
-    }
-
+  let usedFallback = false;
+  if (!ai) {
+    ai = heuristicExtractFromTranscript(transcript);
+    usedFallback = true;
     warnings.push(
-      "The transcript didn't contain enough explicit information to extract structured facts. Only the transcript is stored."
+      flags.gemini
+        ? "Used structured fallback extraction because the AI service did not respond in time."
+        : "No GEMINI_API_KEY configured — used local structured extraction from your transcript."
     );
+  }
+
+  const { updated, suggestedActions } = await applyExtractionToMemory(
+    store,
+    saved,
+    ai,
+    others,
+    input.source === "voice" ? "voice capture" : "entry"
+  );
+
+  if (!ai.empty) {
     return {
-      memory: updated || saved,
-      extracted: [],
-      suggestedActions: [],
+      memory: updated,
+      extracted: [updated],
+      suggestedActions,
       status: "analyzed",
-      message: "Captured. There wasn't enough explicit detail to structure — only your transcript is stored.",
-      warnings,
-      transcriptProvider: input.transcriptProvider,
-    };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "unknown error";
-    const err = await store.updateMemory(saved.id, {
-      extractionStatus: "failed",
-      extractionError: `Gemini extraction failed: ${msg}. The transcript is preserved unchanged.`,
-    });
-    warnings.push("AI extraction failed — the transcript is saved but no structured memory was created.");
-    return {
-      memory: err || saved,
-      extracted: [],
-      suggestedActions: [],
-      status: "failed",
-      message: "The AI could not analyze this transcript — your words are preserved and can be deleted.",
+      message: usedFallback
+        ? `Saved and structured ${ai.topics.length > 0 ? `topics ${ai.topics.slice(0, 3).join(", ")}` : "your memory"} using offline extraction.`
+        : `Extracted ${ai.topics.length > 0 ? `topics ${ai.topics.slice(0, 3).join(", ")}` : "a structured memory"} from your words.`,
       warnings,
       transcriptProvider: input.transcriptProvider,
     };
   }
+
+  warnings.push(
+    "The transcript didn't contain enough explicit detail to extract structured facts. Only the transcript is stored."
+  );
+  return {
+    memory: updated,
+    extracted: [],
+    suggestedActions: [],
+    status: "analyzed",
+    message: "Captured. Only your transcript is stored — add a bit more detail for structured insights.",
+    warnings,
+    transcriptProvider: input.transcriptProvider,
+  };
+}
+
+/** Re-analyzes up to 3 previously failed memories so recoverable captures heal automatically. */
+export async function healFailedMemories(memories: Memory[]): Promise<Memory[]> {
+  const failed = memories.filter((m) => !m.isDemo && m.extractionStatus === "failed").slice(0, 3);
+  if (failed.length === 0) return memories;
+
+  const store = await getStore();
+  const flags = getFlags();
+  const updatedMap = new Map<string, Memory>();
+  const allOthers = memories.filter((m) => !m.isDemo);
+
+  for (const target of failed) {
+    const others = allOthers.filter((m) => m.id !== target.id);
+    let ai: ExtractedPayload | null = null;
+    if (flags.gemini) {
+      try {
+        ai = await extractWithGemini(
+          target.transcript,
+          others.slice(0, 8).map((m) => m.title)
+        );
+      } catch {
+        ai = null;
+      }
+    }
+    if (!ai) ai = heuristicExtractFromTranscript(target.transcript);
+    const { updated } = await applyExtractionToMemory(
+      store,
+      target,
+      ai,
+      others,
+      target.source === "voice" ? "voice capture" : "entry"
+    );
+    updatedMap.set(target.id, updated);
+  }
+
+  return memories.map((m) => updatedMap.get(m.id) || m);
 }
 
 export async function transcribeOnly(input: {

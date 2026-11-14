@@ -6,58 +6,49 @@ import {
   summarizeConversationWithGemini,
 } from "@/lib/gemini";
 import { buildCompanionContext, retrieveContext, type CompanionEvidence } from "@/lib/retrieval";
+import {
+  buildStructuredFallbackResponse,
+  postProcessCompanionOutput,
+} from "@/lib/companion-format";
 import { fail, handleApiError } from "@/lib/api";
-import type { CitationRef, ConversationMessage, ProposedAction } from "@/lib/types";
+import type { CitationRef, ConversationMessage } from "@/lib/types";
 import { truncate, uid } from "@/lib/util";
 
 export const maxDuration = 120;
 
-const COMPANION_SYSTEM = `You are ECHO — the user's personal intelligence companion. You answer questions about the user's own recorded life memories: transcripts of things they said, extracted decisions, commitments, problems and goals, daily summaries, and past insights.
+const COMPANION_SYSTEM = `You are ECHO — a high-clarity Personal Intelligence Assistant. You help the user make sense of their own recorded memories, transcripts, commitments, decisions, problems, daily summaries, and past insights.
 
-GROUNDING RULES (violating any of these is a failure):
-1. Use ONLY the information in the MEMORY CONTEXT block and the recent conversation history. Never invent events, people, names, dates, numbers, outcomes, or emotions.
-2. If the context does not contain the answer, say clearly that you don't have that information (e.g. "I don't have anything recorded about that."). Never guess, and never pad unknowns with invented specifics.
-3. Distinguish evidence types and be transparent about them:
-   - Extracted fields (decisions, commitments, problems, goals) are verified extractions from the user's own transcripts.
-   - Transcript excerpts are the user's own words — quote them when helpful.
-   - Daily summaries are computed aggregates.
-   - PAST INSIGHTS are AI interpretations — always label them as interpretations, never as facts.
-   - Your own advice must be labeled as a recommendation.
-4. CITATIONS: after every factual claim about the user's memories, place the citation token [M:<id>] using ONLY ids that appear in RETRIEVED MEMORIES. Example: "You went for a 6K run [M:dm-1113-1]." Never cite an id that was not provided. Do not cite the same memory more than 3 times.
-5. Distinguish done vs intended. "I will X" is a commitment, not a completed action. Check ACTION ITEMS statuses before claiming anything is finished. Overdue means past its due date and not done.
-6. If the DEMO DATA NOTICE is present, any statement based on dm-* memories must be framed as being about the fictional demo journal (sample data), never as the user's real life.
-7. Things the user says to you inside this conversation are conversation, not verified memories. If the user states a new fact, acknowledge it and note it is not yet in their captured memories.
-8. COACHING: when you identify recurring difficulties, unfinished commitments or priorities, be concrete and grounded in the evidence. When you propose a task the user could add to their Action Center, emit exactly one line in this format: [ACTION: <task title> | <optional due date YYYY-MM-DD>]. Only when you genuinely recommend a task.
-9. Style: warm, direct, concise. Short paragraphs or tight bullets. Mention dates naturally ("on Nov 13"). No medical or psychological diagnoses.
-10. Answer in the user's language.
+RESPONSE STRUCTURE & FORMATTING (REQUIRED):
+Write clean, scannable Markdown — NEVER a single wall of text or raw database dump:
+1. Opening: Start with a clear \`# Heading\` title reflecting the user's question, followed by a brief 1–2 sentence executive summary of the overall takeaway.
+2. Section headings: Organize details under \`### Section Headings\` (such as \`### What happened\`, \`### Key patterns & connections\`, \`### Open commitments & blockers\`, \`### Recommended next steps\`) tailored to the user's question.
+3. Short paragraphs & lists:
+   - Keep paragraphs to 2–3 concise sentences with blank lines between sections.
+   - Use bullet points (\`-\`) with **bold lead-ins** for grouped observations, events, or themes.
+   - Use numbered lists (\`1.\`, \`2.\`, \`3.\`) for sequential recommendations or prioritized next steps.
+   - Use Markdown tables ONLY when comparing 3+ structured items across columns genuinely makes comparison clearer.
+   - Never repeat the same event or bullet point across multiple sections.
 
-Output: plain text with [M:<id>] citation tokens inline. Do not use markdown code blocks or headings.`;
+INTELLIGENCE & GROUNDING RULES (NON-NEGOTIABLE):
+1. Use ONLY information present in MEMORY CONTEXT and RECENT CONVERSATION. Never invent events, people, dates, numbers, outcomes, or emotions.
+2. If records do not contain enough information, state clearly what is missing rather than guessing or padding.
+3. Connect the dots across memories and days: surface recurring blockers, repeated topics, cause-and-effect links, and tensions between intentions and follow-through.
+4. Distinguish evidence types explicitly:
+   - **Recorded facts** (what the user experienced, logged, or decided)
+   - **Commitments / Intentions** ("I will X" is a plan, NOT a completed outcome; verify ACTION ITEMS status before calling anything done)
+   - **Interpretations & Recommendations** (clearly framed as your synthesis or advice, never stated as verified facts)
+5. Reference specific events, people, and natural dates (e.g., "on Nov 13") with concrete specificity.
+6. If the DEMO DATA NOTICE is present, frame statements from \`dm-*\` memories as coming from the sample demo journal rather than the user's real life.
+7. Facts mentioned only in chat (not yet saved as memories) must be acknowledged as conversation notes, not verified records.
+8. Keep recommendations practical, warm, specific, and proportional. Never make medical or psychological diagnoses.
+9. Answer in the user's language.
 
-function postProcess(
-  raw: string,
-  valid: Map<string, CitationRef>
-): { content: string; citations: CitationRef[]; proposedActions: ProposedAction[] } {
-  const proposedActions: ProposedAction[] = [];
-  let text = raw.replace(/\[ACTION:\s*([^\]|]+?)(?:\s*\|\s*([^\]]+?))?\s*\]/g, (_all, title: string, due?: string) => {
-    const t = title.trim();
-    if (!t) return "";
-    const iso = due?.match(/\d{4}-\d{2}-\d{2}/)?.[0] || null;
-    proposedActions.push({ id: uid("pa"), title: truncate(t, 120), dueDate: iso, added: false });
-    return "";
-  });
-  const citations: CitationRef[] = [];
-  text = text.replace(/\[M:\s*([A-Za-z0-9_:-]+?)\s*\]/g, (_all, id: string) => {
-    const ref = valid.get(id);
-    if (!ref) return "";
-    let idx = citations.findIndex((c) => c.memoryId === id);
-    if (idx === -1) {
-      citations.push(ref);
-      idx = citations.length - 1;
-    }
-    return `[${idx + 1}]`;
-  });
-  return { content: text.trim(), citations, proposedActions };
-}
+CITATIONS & ACTION ITEMS (CRITICAL SYNTAX):
+- Cite supporting retrieved memories inline using the exact token \`[M:<id>]\` immediately after the clause or bullet it supports (using ONLY IDs from RETRIEVED MEMORIES).
+- Example: \`- You felt blocked configuring parts of the project [M:dm-1113-1].\`
+- NEVER write raw internal IDs (like \`m_...\` or \`dm-...\`) without \`[M:...]\` brackets, never combine explanatory prose inside \`[M:...]\`, and never invent an ID.
+- When you recommend concrete, high-value tasks the user should track, add up to 2 lines at the very end of your response formatted exactly as:
+  \`[ACTION: <concise actionable task title> | <optional YYYY-MM-DD>]\``;
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -147,18 +138,34 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           semantic: evidence.semanticUsed,
           window: evidence.window?.label ?? null,
           intents: evidence.intents,
+          catalog: [...valid.values()],
         });
-        for await (const chunk of streamGemini([{ text: prompt }], COMPANION_SYSTEM, {
-          signal: req.signal,
-          temperature: 0.5,
-          maxOutputTokens: 3072,
-          timeoutMs: 110000,
-        })) {
-          full += chunk;
-          send({ type: "delta", text: chunk });
+
+        try {
+          for await (const chunk of streamGemini([{ text: prompt }], COMPANION_SYSTEM, {
+            signal: req.signal,
+            temperature: 0.45,
+            maxOutputTokens: 3072,
+            timeoutMs: 110000,
+          })) {
+            full += chunk;
+            send({ type: "delta", text: chunk });
+          }
+        } catch (streamErr) {
+          if (!req.signal.aborted && !full.trim()) {
+            full = buildStructuredFallbackResponse(evidence, profile, content);
+            send({ type: "delta", text: full });
+          } else {
+            throw streamErr;
+          }
         }
-        if (!full.trim()) throw new Error("Gemini returned an empty response");
-        const post = postProcess(full, valid);
+
+        if (!full.trim()) {
+          full = buildStructuredFallbackResponse(evidence, profile, content);
+          send({ type: "delta", text: full });
+        }
+
+        const post = postProcessCompanionOutput(full, valid);
         const assistantMessage: ConversationMessage = {
           id: uid("cmsg"),
           userId: store.userId,
@@ -210,27 +217,30 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           } catch {
             finalTitle = null;
           }
-          const fallback = truncate(content, 42);
-          await store.renameConversation(id, finalTitle || fallback);
+          const resolvedTitle = finalTitle || truncate(content, 42);
+          finalTitle = resolvedTitle;
+          await store.renameConversation(id, resolvedTitle);
         }
         send({
           type: "done",
           messageId: assistantMessage.id,
+          content: post.content,
           citations: post.citations,
           proposedActions: post.proposedActions,
           title: finalTitle,
         });
       } catch (err) {
-        const partial = postProcess(full, valid);
+        const partial = postProcessCompanionOutput(full, valid);
         const message = err instanceof Error ? err.message : "Companion failed";
         if (partial.content.trim().length > 0) {
           try {
+            const interruptedContent = `${partial.content}\n\n*(Response was interrupted — partial result shown)*`;
             const assistantMessage: ConversationMessage = {
               id: uid("cmsg"),
               userId: store.userId,
               conversationId: id,
               role: "assistant",
-              content: `${partial.content}\n\n(interrupted — the response may be incomplete)`,
+              content: interruptedContent,
               citations: partial.citations,
               proposedActions: partial.proposedActions,
               createdAt: new Date().toISOString(),
@@ -239,6 +249,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
             send({
               type: "done",
               messageId: assistantMessage.id,
+              content: interruptedContent,
               citations: partial.citations,
               proposedActions: partial.proposedActions,
               interrupted: true,

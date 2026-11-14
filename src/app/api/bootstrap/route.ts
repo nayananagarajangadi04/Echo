@@ -1,5 +1,6 @@
 import { getScopedStore } from "@/lib/store";
 import { getFlags } from "@/lib/env";
+import { healFailedMemories } from "@/lib/ingest";
 import { dailyScore, computeInsights } from "@/lib/insights";
 import { handleApiError, ok, searchParamsOf } from "@/lib/api";
 import { todayISO } from "@/lib/util";
@@ -10,7 +11,10 @@ export async function GET(req: Request) {
     const date = searchParamsOf(req).get("date") || todayISO();
     const { store, profile, demoMode } = await getScopedStore();
     const flags = getFlags();
-    const memories = await store.listMemories({ demoMode });
+    let memories = await store.listMemories({ demoMode });
+    if (memories.some((m) => !m.isDemo && m.extractionStatus === "failed")) {
+      memories = await healFailedMemories(memories);
+    }
     const actions = await store.listActions({ demoMode });
     const recordings = await store.listRecordings(date, demoMode);
     const goals = await store.listGoals(demoMode);

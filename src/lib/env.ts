@@ -107,6 +107,12 @@ export function getFlags(): StoreFlags {
   };
 }
 
+const DEPRECATED_FLASH_RE = /^gemini-(?:2\.[05]|1\.5)-flash$/i;
+
 export function geminiModel(): string {
-  return cleanEnvValue(process.env.GEMINI_MODEL) || "gemini-2.5-flash";
+  const configured = cleanEnvValue(process.env.GEMINI_MODEL);
+  if (!configured || DEPRECATED_FLASH_RE.test(configured)) {
+    return "gemini-3.5-flash-lite";
+  }
+  return configured;
 }

@@ -1,4 +1,4 @@
-import { geminiModel } from "./env";
+import { geminiApiKey, geminiModel } from "./env";
 import type { MemoryCategory } from "./types";
 import { clamp, dedupe, truncate } from "./util";
 
@@ -13,12 +13,24 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
+function candidateModels(): string[] {
+  return dedupe([
+    geminiModel(),
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+  ]).filter(Boolean);
+}
+
 async function callGemini(
   parts: unknown[],
   system?: string,
   timeoutMs = 60000
 ): Promise<string | null> {
-  const key = process.env.GEMINI_API_KEY;
+  const key = geminiApiKey();
   if (!key) return null;
   const body: Record<string, unknown> = {
     contents: [{ role: "user", parts }],
@@ -26,35 +38,51 @@ async function callGemini(
   };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
 
+  const models = candidateModels();
+  const perModelTimeout = Math.min(timeoutMs, 15000);
   let lastError = "unknown Gemini error";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) {
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    try {
-      const res = await fetch(
-        `${ENDPOINT}/${geminiModel()}:generateContent?key=${encodeURIComponent(key)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(timeoutMs),
-        }
-      );
-      if (!res.ok) {
-        lastError = `Gemini API error (${res.status}): ${await readError(res)}`;
-        if (res.status === 503 || res.status === 429) continue;
-        throw new Error(lastError);
+
+  for (let mIdx = 0; mIdx < models.length; mIdx++) {
+    const model = models[mIdx];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 900));
       }
-      const data = (await res.json()) as {
-        candidates?: { content?: { parts?: { text?: string }[] } }[];
-      };
-      const text =
-        data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") ?? "";
-      return text.trim() || null;
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith("Gemini API error")) throw err;
-      lastError = err instanceof Error ? err.message : String(err);
+      try {
+        const res = await fetch(
+          `${ENDPOINT}/${model}:generateContent?key=${encodeURIComponent(key)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(perModelTimeout),
+          }
+        );
+        if (!res.ok) {
+          lastError = `Gemini API error (${res.status}): ${await readError(res)}`;
+          if (res.status === 429 || res.status === 503 || res.status === 404) {
+            if (attempt === 0 && res.status === 503) continue;
+            break; // try next candidate model
+          }
+          throw new Error(lastError);
+        }
+        const data = (await res.json()) as {
+          candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
+        };
+        const text =
+          data?.candidates?.[0]?.content?.parts
+            ?.filter((p) => !p.thought)
+            .map((p) => p.text || "")
+            .join("") ?? "";
+        return text.trim() || null;
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("Gemini API error")) {
+          if (!/\((?:429|503|404)\)/.test(err.message)) throw err;
+          lastError = err.message;
+          break;
+        }
+        lastError = err instanceof Error ? err.message : String(err);
+      }
     }
   }
   throw new Error(`Gemini API error: ${lastError}`);
@@ -279,7 +307,7 @@ export async function* streamGemini(
   system: string,
   opts: StreamOptions = {}
 ): AsyncGenerator<string> {
-  const key = process.env.GEMINI_API_KEY;
+  const key = geminiApiKey();
   if (!key) throw new Error("GEMINI_API_KEY is missing");
   const body: Record<string, unknown> = {
     contents: [{ role: "user", parts }],
@@ -293,18 +321,46 @@ export async function* streamGemini(
   const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 120000);
   const onAbort = () => controller.abort();
   opts.signal?.addEventListener("abort", onAbort);
+  const models = candidateModels();
+  const connectTimeoutMs = Math.min(opts.timeoutMs ?? 15000, 15000);
   try {
-    const res = await fetch(
-      `${ENDPOINT}/${geminiModel()}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
+    let activeRes: Response | null = null;
+    let lastError = "Gemini API error: unavailable";
+
+    for (const model of models) {
+      if (opts.signal?.aborted) throw new Error("Aborted");
+      try {
+        const res = await fetch(
+          `${ENDPOINT}/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(connectTimeoutMs)]),
+          }
+        );
+        if (res.ok) {
+          activeRes = res;
+          break;
+        }
+        lastError = `Gemini API error (${res.status}): ${await readError(res)}`;
+        if (res.status === 429 || res.status === 503 || res.status === 404) {
+          continue;
+        }
+        throw new Error(lastError);
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
+        if (err instanceof Error && err.message.startsWith("Gemini API error")) {
+          if (!/\((?:429|503|404)\)/.test(err.message)) throw err;
+          lastError = err.message;
+          continue;
+        }
+        lastError = err instanceof Error ? err.message : String(err);
       }
-    );
-    if (!res.ok) throw new Error(`Gemini API error (${res.status}): ${await readError(res)}`);
-    const reader = res.body?.getReader();
+    }
+
+    if (!activeRes) throw new Error(lastError);
+    const reader = activeRes.body?.getReader();
     if (!reader) throw new Error("Gemini stream has no body");
     const decoder = new TextDecoder();
     let buf = "";
@@ -321,10 +377,13 @@ export async function* streamGemini(
         if (!payload || payload === "[DONE]") continue;
         try {
           const json = JSON.parse(payload) as {
-            candidates?: { content?: { parts?: { text?: string }[] } }[];
+            candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
           };
           const chunk =
-            json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+            json?.candidates?.[0]?.content?.parts
+              ?.filter((p) => !p.thought)
+              .map((p) => p.text || "")
+              .join("") || "";
           if (chunk) yield chunk;
         } catch {
           /* skip malformed SSE line */
@@ -344,7 +403,7 @@ export async function embedTexts(
   texts: string[],
   taskType: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT"
 ): Promise<number[][] | null> {
-  const key = process.env.GEMINI_API_KEY;
+  const key = geminiApiKey();
   if (!key || texts.length === 0 || texts.length > 100) return null;
   for (let i = 0; i < EMBED_MODELS.length; i++) {
     const model = EMBED_MODELS[(embedModelIdx + i) % EMBED_MODELS.length];

@@ -4,7 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
+  ArrowUp,
+  BookOpen,
   Bot,
+  Calendar,
   Check,
   ListPlus,
   Menu,
@@ -15,12 +18,20 @@ import {
   Trash2,
 } from "lucide-react";
 import { api, del, post } from "@/lib/client";
-import { MemoryChipLink, MemoryDrawer } from "@/components/MemoryDrawer";
+import { CompanionMarkdown } from "@/components/CompanionMarkdown";
+import { MemoryDrawer } from "@/components/MemoryDrawer";
 import { Spinner } from "@/components/ui";
+import { stripStreamingArtifacts } from "@/lib/companion-format";
 import { useEcho } from "@/lib/echo-context";
 import { cn } from "@/lib/cn";
 import { dateLabel } from "@/lib/util";
 import type { CitationRef, Conversation, ProposedAction } from "@/lib/types";
+
+interface RetrievalMeta {
+  memories: number;
+  semantic: boolean;
+  window: string | null;
+}
 
 interface ChatMsg {
   id: string;
@@ -32,27 +43,53 @@ interface ChatMsg {
   streaming?: boolean;
   error?: string;
   interrupted?: boolean;
-  retrieval?: { memories: number; semantic: boolean; window: string | null } | null;
+  retrieval?: RetrievalMeta | null;
 }
 
 const SUGGESTED: { label: string; q: string }[] = [
-  { label: "Understand my day", q: "Help me understand my day — what happened and what stands out?" },
-  { label: "What am I struggling with?", q: "What am I struggling with recently?" },
-  { label: "Find recurring patterns", q: "What patterns have you noticed in my recent learning and habits?" },
-  { label: "Review my weekly progress", q: "Compare my activities this week with last week. How am I doing?" },
-  { label: "What have I been avoiding?", q: "What have I been avoiding?" },
-  { label: "Help me plan tomorrow", q: "What should I prioritize tomorrow based on my history?" },
+  {
+    label: "Understand my day",
+    q: "Help me understand my day — what happened and what stands out?",
+  },
+  {
+    label: "What am I struggling with?",
+    q: "What am I struggling with recently?",
+  },
+  {
+    label: "Find recurring patterns",
+    q: "What patterns have you noticed in my recent learning and habits?",
+  },
+  {
+    label: "Review my weekly progress",
+    q: "Compare my activities this week with last week. How am I doing?",
+  },
+  {
+    label: "What have I been avoiding?",
+    q: "What have I been avoiding?",
+  },
+  {
+    label: "Help me plan tomorrow",
+    q: "What should I prioritize tomorrow based on my history?",
+  },
 ];
 
 type StreamEvent =
-  | { type: "retrieval"; memories: number; semantic: boolean; window: string | null }
+  | {
+      type: "retrieval";
+      memories: number;
+      semantic: boolean;
+      window: string | null;
+      catalog?: CitationRef[];
+    }
   | { type: "delta"; text: string }
   | {
       type: "done";
       messageId: string;
+      content?: string;
       citations: CitationRef[];
       proposedActions: ProposedAction[];
       interrupted?: boolean;
+      title?: string | null;
     }
   | { type: "error"; error: string };
 
@@ -83,32 +120,6 @@ function groupConversations(convs: Conversation[]): { label: string; items: Conv
     .map(([label, items]) => ({ label, items }));
 }
 
-function renderContent(
-  content: string,
-  citations: CitationRef[],
-  onOpen: (id: string) => void
-) {
-  const parts = content.split(/(\[\d+\])/g);
-  return parts.map((part, i) => {
-    const m = part.match(/^\[(\d+)\]$/);
-    if (m) {
-      const ref = citations[Number(m[1]) - 1];
-      if (!ref) return <span key={i}>{part}</span>;
-      return (
-        <button
-          key={i}
-          onClick={() => onOpen(ref.memoryId)}
-          title={`${ref.title} — ${dateLabel(ref.date)} ${ref.time}`}
-          className="mx-0.5 inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-md border border-accent/40 bg-accent/15 px-1 align-middle text-[10px] font-semibold text-accent transition hover:bg-accent/30"
-        >
-          {m[1]}
-        </button>
-      );
-    }
-    return <span key={i}>{part}</span>;
-  });
-}
-
 export default function CompanionPage() {
   const { profile, stats, demoMode, refresh, flags } = useEcho();
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -118,16 +129,33 @@ export default function CompanionPage() {
   const [loadingThread, setLoadingThread] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const [retrievalInfo, setRetrievalInfo] = useState<{ memories: number; semantic: boolean; window: string | null } | null>(null);
+  const [streamCatalog, setStreamCatalog] = useState<CitationRef[]>([]);
+  const [retrievalInfo, setRetrievalInfo] = useState<RetrievalMeta | null>(null);
   const [input, setInput] = useState("");
   const [openMemoryId, setOpenMemoryId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const streamTextRef = useRef("");
+  const streamCatalogRef = useRef<CitationRef[]>([]);
+
   useEffect(() => {
     streamTextRef.current = streamText;
   }, [streamText]);
+
+  useEffect(() => {
+    streamCatalogRef.current = streamCatalog;
+  }, [streamCatalog]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
+
   const name = profile.displayName || profile.fullName || "there";
 
   const loadConversations = useCallback(async () => {
@@ -156,6 +184,8 @@ export default function CompanionPage() {
     setLoadingThread(true);
     setMessages([]);
     setStreamText("");
+    setStreamCatalog([]);
+    setRetrievalInfo(null);
     try {
       const data = await api<{ conversation: Conversation; messages: ChatMsg[] }>(
         `/api/companion/conversations/${id}`
@@ -175,6 +205,8 @@ export default function CompanionPage() {
       setActiveId(data.conversation.id);
       setMessages([]);
       setStreamText("");
+      setStreamCatalog([]);
+      setRetrievalInfo(null);
       setSidebarOpen(false);
       return data.conversation.id;
     } catch {
@@ -198,12 +230,15 @@ export default function CompanionPage() {
     [activeId]
   );
 
-  const finalizeAssistant = useCallback(
-    (id: string, patch: Partial<ChatMsg>) => {
-      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch, streaming: false } : m)));
-    },
-    []
-  );
+  const finalizeAssistant = useCallback((id: string, patch: Partial<ChatMsg>) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, ...patch, streaming: false } : m))
+    );
+  }, []);
+
+  const patchAssistantRetrieval = useCallback((id: string, meta: RetrievalMeta) => {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, retrieval: meta } : m)));
+  }, []);
 
   const send = useCallback(
     async (raw: string) => {
@@ -214,6 +249,7 @@ export default function CompanionPage() {
         convId = await newConversation();
         if (!convId) return;
       }
+
       const tempUser: ChatMsg = {
         id: `tmp_u_${Date.now()}`,
         role: "user",
@@ -226,6 +262,7 @@ export default function CompanionPage() {
       setInput("");
       setStreaming(true);
       setStreamText("");
+      setStreamCatalog([]);
       setRetrievalInfo(null);
 
       const controller = new AbortController();
@@ -275,17 +312,34 @@ export default function CompanionPage() {
               continue;
             }
             if (ev.type === "retrieval") {
-              setRetrievalInfo({ memories: ev.memories, semantic: ev.semantic, window: ev.window });
+              const meta: RetrievalMeta = {
+                memories: ev.memories,
+                semantic: ev.semantic,
+                window: ev.window,
+              };
+              setRetrievalInfo(meta);
+              setStreamCatalog(ev.catalog || []);
+              patchAssistantRetrieval(streamId, meta);
             } else if (ev.type === "delta") {
               setStreamText((prev) => prev + ev.text);
             } else if (ev.type === "done") {
+              const fallbackCleaned = stripStreamingArtifacts(
+                streamTextRef.current,
+                streamCatalogRef.current
+              );
               finalizeAssistant(streamId, {
                 id: ev.messageId,
-                content: streamTextRef.current,
+                content: ev.content ?? fallbackCleaned.content,
                 citations: ev.citations,
                 proposedActions: ev.proposedActions,
                 interrupted: ev.interrupted,
               });
+              if (ev.title) {
+                const updatedTitle = ev.title;
+                setConversations((prev) =>
+                  prev.map((c) => (c.id === convId ? { ...c, title: updatedTitle } : c))
+                );
+              }
               done = true;
             } else if (ev.type === "error") {
               finalizeAssistant(streamId, { error: ev.error });
@@ -296,8 +350,15 @@ export default function CompanionPage() {
       } catch (err) {
         const aborted = err instanceof DOMException && err.name === "AbortError";
         if (aborted) {
+          const fallbackCleaned = stripStreamingArtifacts(
+            streamTextRef.current,
+            streamCatalogRef.current
+          );
           finalizeAssistant(streamId, {
-            content: streamTextRef.current + "\n\n(stopped)",
+            content: fallbackCleaned.content
+              ? `${fallbackCleaned.content}\n\n*(Response stopped by you)*`
+              : "*(Response stopped by you)*",
+            citations: fallbackCleaned.citations,
             streaming: false,
           });
         } else {
@@ -308,14 +369,21 @@ export default function CompanionPage() {
       } finally {
         setStreaming(false);
         setStreamText("");
+        setStreamCatalog([]);
         abortRef.current = null;
         void loadConversations();
       }
     },
-    [activeId, streaming, newConversation, finalizeAssistant, loadConversations]
+    [
+      activeId,
+      streaming,
+      newConversation,
+      finalizeAssistant,
+      patchAssistantRetrieval,
+      loadConversations,
+    ]
   );
 
-  /* keep latest stream text for abort handling */
   const stop = useCallback(() => {
     abortRef.current?.abort();
   }, []);
@@ -355,12 +423,12 @@ export default function CompanionPage() {
   const canSend = input.trim().length > 0 && !streaming;
 
   const sidebar = (
-    <div className="flex h-full w-64 shrink-0 flex-col border-r border-line bg-ink-950/60">
+    <div className="flex h-full w-64 shrink-0 flex-col border-r border-line bg-ink-950/75">
       <div className="p-3">
         <button
           onClick={() => void newConversation()}
           disabled={streaming}
-          className="flex w-full items-center justify-center gap-2 rounded-xl grad-accent px-3 py-2.5 text-[13px] font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
+          className="flex w-full items-center justify-center gap-2 rounded-xl grad-accent px-3 py-2.5 text-[13px] font-semibold text-white shadow-sm shadow-accent/20 transition hover:brightness-110 disabled:opacity-40"
         >
           <MessageSquarePlus className="h-4 w-4" /> New conversation
         </button>
@@ -379,15 +447,17 @@ export default function CompanionPage() {
         ) : (
           groups.map((g) => (
             <div key={g.label} className="mb-3">
-              <div className="px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-dim">
+              <div className="px-2.5 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-dim">
                 {g.label}
               </div>
               {g.items.map((c) => (
                 <div
                   key={c.id}
                   className={cn(
-                    "group flex items-center gap-1 rounded-lg px-2 py-1.5 transition",
-                    c.id === activeId ? "bg-panel-3" : "hover:bg-panel-2"
+                    "group flex items-center gap-1 rounded-lg border px-2.5 py-1.5 transition",
+                    c.id === activeId
+                      ? "border-accent/25 bg-panel-3/90"
+                      : "border-transparent hover:bg-panel-2"
                   )}
                 >
                   <button
@@ -421,16 +491,17 @@ export default function CompanionPage() {
           ))
         )}
       </div>
-      <div className="border-t border-line px-3 py-2.5 text-[10px] leading-relaxed text-dim">
-        {stats.totalMemories} memories · {stats.daysCovered} days
-        <br />
-        Answers cite your actual records.
+      <div className="border-t border-line px-3.5 py-3 text-[10.5px] leading-relaxed text-dim">
+        <div className="font-medium text-muted">
+          {stats.totalMemories} memories · {stats.daysCovered} days
+        </div>
+        Answers are synthesized directly from your saved records.
       </div>
     </div>
   );
 
   return (
-    <div className="flex h-[calc(100dvh-11.5rem)] min-h-[520px] overflow-hidden rounded-2xl border border-line bg-ink-900/40 md:h-[calc(100vh-6.5rem)]">
+    <div className="flex h-[calc(100dvh-11.5rem)] min-h-[520px] overflow-hidden rounded-2xl border border-line bg-ink-900/50 md:h-[calc(100vh-6.5rem)]">
       <div className="hidden md:flex">{sidebar}</div>
 
       <AnimatePresence>
@@ -457,8 +528,8 @@ export default function CompanionPage() {
       </AnimatePresence>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-line px-3">
-          <div className="flex min-w-0 items-center gap-2">
+        <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-line bg-ink-950/35 px-3 sm:px-4">
+          <div className="flex min-w-0 items-center gap-2.5">
             <button
               onClick={() => setSidebarOpen(true)}
               className="rounded-lg p-1.5 text-muted transition hover:bg-panel-2 md:hidden"
@@ -466,7 +537,9 @@ export default function CompanionPage() {
             >
               <Menu className="h-4 w-4" />
             </button>
-            <Bot className="h-4 w-4 shrink-0 text-accent" />
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-accent/25 bg-accent/10 text-accent">
+              <Bot className="h-3.5 w-3.5" />
+            </span>
             <span className="truncate text-[13px] font-medium text-fg-strong">
               {activeTitle || "ECHO Companion"}
             </span>
@@ -482,182 +555,262 @@ export default function CompanionPage() {
             className="flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-[11px] font-medium text-muted transition hover:border-accent/40 hover:text-fg disabled:opacity-40"
           >
             <MessageSquarePlus className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">New</span>
+            <span className="hidden sm:inline">New chat</span>
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-6">
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-5 sm:px-6">
           {messages.length === 0 && !loadingThread && !streaming ? (
             <div className="mx-auto flex h-full max-w-2xl flex-col items-center justify-center py-6 text-center">
               <div className="flex h-12 w-12 items-center justify-center rounded-2xl grad-accent shadow-lg shadow-accent/20">
                 <Sparkles className="h-6 w-6 text-white" />
               </div>
-              <h1 className="mt-4 text-xl font-bold tracking-tight text-fg-strong">
+              <h1 className="mt-4 text-xl font-bold tracking-tight text-fg-strong sm:text-2xl">
                 Hi {name} — ask me anything about your life.
               </h1>
-              <p className="mt-2 max-w-md text-[12.5px] leading-relaxed text-muted">
-                I search your captured memories before every answer. Everything I say about your
-                past comes with a citation you can open.
-                {!flags.gemini && " (AI features need GEMINI_API_KEY in settings.)"}
+              <p className="mt-2 max-w-lg text-[13px] leading-relaxed text-muted">
+                I retrieve and cross-reference your captured memories before answering, surface patterns
+                across days, and link every takeaway back to its source memory.
+                {!flags.gemini && " (AI features need GEMINI_API_KEY configured on the server.)"}
               </p>
-              <div className="mt-5 grid w-full gap-2 sm:grid-cols-2">
+              <div className="mt-6 grid w-full gap-2.5 sm:grid-cols-2">
                 {SUGGESTED.map((s) => (
                   <button
                     key={s.label}
                     onClick={() => void send(s.q)}
                     disabled={!flags.gemini}
-                    className="group rounded-xl border border-line bg-panel-2 px-3.5 py-3 text-left transition hover:border-accent/40 hover:bg-panel-3 disabled:opacity-40"
+                    className="group rounded-xl border border-line bg-panel-2/85 px-4 py-3 text-left transition hover:border-accent/40 hover:bg-panel-3 disabled:opacity-40"
                   >
-                    <div className="flex items-center gap-2 text-[12.5px] font-medium text-fg-strong">
-                      <Search className="h-3.5 w-3.5 text-accent/80" />
+                    <div className="flex items-center gap-2 text-[13px] font-medium text-fg-strong">
+                      <Search className="h-3.5 w-3.5 shrink-0 text-accent/80 transition group-hover:text-accent" />
                       {s.label}
                     </div>
-                    <div className="mt-0.5 truncate text-[11px] text-dim">{s.q}</div>
+                    <div className="mt-1 truncate text-[11.5px] text-dim">{s.q}</div>
                   </button>
                 ))}
               </div>
             </div>
           ) : (
-            <div className="mx-auto max-w-3xl space-y-5">
+            <div className="mx-auto max-w-3xl space-y-6">
               {loadingThread && (
-                <div className="flex items-center justify-center gap-2 py-10 text-[12px] text-dim">
+                <div className="flex items-center justify-center gap-2 py-12 text-[12px] text-dim">
                   <Spinner className="h-4 w-4" /> Loading conversation…
                 </div>
               )}
-              {messages.map((m) => (
-                <motion.div
-                  key={m.id}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className={cn("flex gap-3", m.role === "user" && "flex-row-reverse")}
-                >
-                  <span
-                    className={cn(
-                      "mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg",
-                      m.role === "user" ? "bg-panel-3 text-fg" : "grad-accent"
-                    )}
-                  >
-                    {m.role === "user" ? (
-                      <span className="text-[11px] font-semibold">
-                        {(profile.displayName || profile.fullName || "Y").charAt(0).toUpperCase()}
-                      </span>
-                    ) : (
-                      <Sparkles className="h-3.5 w-3.5 text-white" />
-                    )}
-                  </span>
-                  <div className={cn("min-w-0 max-w-[88%]", m.role === "user" && "text-right")}>
-                    {m.role === "user" ? (
-                      <div className="inline-block whitespace-pre-line rounded-2xl rounded-br-sm bg-accent/20 px-4 py-2.5 text-left text-[13px] leading-relaxed text-fg">
-                        {m.content}
-                      </div>
-                    ) : m.error ? (
-                      <div className="rounded-2xl rounded-bl-sm border border-red-500/30 bg-red-500/10 px-4 py-3 text-left text-[13px] leading-relaxed text-red-200">
-                        <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-red-300">
-                          <AlertTriangle className="h-3.5 w-3.5" /> Something went wrong
-                        </div>
-                        {m.error}
-                        <button
-                          onClick={() => void send(messages[messages.indexOf(m) - 1]?.content || "")}
-                          className="mt-2 block rounded-lg border border-red-400/30 px-2.5 py-1 text-[11px] text-red-200 transition hover:bg-red-500/20"
-                        >
-                          Retry
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="rounded-2xl rounded-bl-sm border border-line bg-panel px-4 py-3 text-left text-[13px] leading-relaxed text-fg">
-                        {renderContent(
-                          m.streaming ? streamText : m.content,
-                          m.citations,
-                          setOpenMemoryId
-                        )}
-                        {m.streaming && (
-                          <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse bg-accent align-middle" />
-                        )}
-                        {m.interrupted && (
-                          <div className="mt-2 text-[10.5px] text-amber-300/80">
-                            Response was interrupted — it may be incomplete.
-                          </div>
-                        )}
-                        {m.citations.length > 0 && (
-                          <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-line pt-2.5">
-                            {m.citations.map((c, i) => (
-                              <MemoryChipLink
-                                key={c.memoryId + i}
-                                id={c.memoryId}
-                                title={`${dateLabel(c.date)}${c.time ? ` · ${c.time}` : ""} — ${c.title}`}
-                                date={c.date}
-                                onClick={(id) => setOpenMemoryId(id)}
-                              />
-                            ))}
-                          </div>
-                        )}
-                        {m.proposedActions.length > 0 && (
-                          <div className="mt-2.5 space-y-1.5">
-                            {m.proposedActions.map((pa) => (
-                              <div
-                                key={pa.id}
-                                className="flex items-center justify-between gap-2 rounded-lg border border-accent/25 bg-accent/10 px-3 py-2"
-                              >
-                                <div className="min-w-0 text-[12px] text-fg">
-                                  <span className="font-medium">{pa.title}</span>
-                                  {pa.dueDate && (
-                                    <span className="text-dim"> · due {dateLabel(pa.dueDate)}</span>
-                                  )}
-                                </div>
-                                <button
-                                  onClick={() => void addProposedAction(m.id, pa)}
-                                  disabled={pa.added}
-                                  className={cn(
-                                    "flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition",
-                                    pa.added
-                                      ? "cursor-default text-emerald-300"
-                                      : "grad-accent text-white hover:brightness-110"
-                                  )}
-                                >
-                                  {pa.added ? (
-                                    <>
-                                      <Check className="h-3 w-3" /> Added
-                                    </>
-                                  ) : (
-                                    <>
-                                      <ListPlus className="h-3 w-3" /> Add to Action Center
-                                    </>
-                                  )}
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </motion.div>
-              ))}
 
-              {streaming && !streamText && (
-                <div className="flex items-center gap-2.5 pl-10 text-[12px] text-dim">
-                  <Spinner className="h-4 w-4 text-accent" />
-                  {retrievalInfo
-                    ? `Searched ${retrievalInfo.memories} memories${
-                        retrievalInfo.window ? ` from ${retrievalInfo.window}` : ""
-                      }${retrievalInfo.semantic ? " (semantic match)" : ""} — thinking…`
-                    : "Searching your memories…"}
-                </div>
-              )}
+              {messages.map((m) => {
+                const liveStream = m.streaming
+                  ? stripStreamingArtifacts(streamText, streamCatalog)
+                  : null;
+                const displayContent = liveStream ? liveStream.content : m.content;
+                const displayCitations =
+                  liveStream && liveStream.citations.length > 0
+                    ? liveStream.citations
+                    : m.citations;
+
+                if (m.role === "user") {
+                  return (
+                    <motion.div
+                      key={m.id}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex flex-row-reverse items-start gap-3"
+                    >
+                      <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-line bg-panel-3 text-[11px] font-semibold text-fg">
+                        {(profile.displayName || profile.fullName || "Y")
+                          .charAt(0)
+                          .toUpperCase()}
+                      </span>
+                      <div className="min-w-0 max-w-[85%] text-right sm:max-w-[78%]">
+                        <div className="inline-block whitespace-pre-wrap rounded-2xl rounded-tr-sm border border-accent/25 bg-accent/15 px-4 py-2.5 text-left text-[13.5px] leading-relaxed text-fg-strong">
+                          {m.content}
+                        </div>
+                      </div>
+                    </motion.div>
+                  );
+                }
+
+                return (
+                  <motion.div
+                    key={m.id}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="flex items-start gap-3"
+                  >
+                    <span className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg grad-accent shadow-sm shadow-accent/20">
+                      <Sparkles className="h-3.5 w-3.5 text-white" />
+                    </span>
+
+                    <div className="min-w-0 flex-1">
+                      {m.error ? (
+                        <div className="rounded-2xl rounded-tl-sm border border-red-500/30 bg-red-500/10 px-4 py-3.5 text-left text-[13px] leading-relaxed text-red-200">
+                          <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-red-300">
+                            <AlertTriangle className="h-3.5 w-3.5" /> Something went wrong
+                          </div>
+                          {m.error}
+                          <button
+                            onClick={() =>
+                              void send(messages[messages.indexOf(m) - 1]?.content || "")
+                            }
+                            className="mt-2.5 inline-flex items-center rounded-lg border border-red-400/30 px-2.5 py-1 text-[11px] font-medium text-red-200 transition hover:bg-red-500/20"
+                          >
+                            Retry
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="rounded-2xl rounded-tl-sm border border-line bg-panel px-4 py-4 shadow-sm sm:px-6 sm:py-5">
+                          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-line/70 pb-2.5">
+                            <div className="flex items-center gap-2 text-[11px] font-medium text-muted">
+                              <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+                              <span className="text-fg-strong">ECHO Intelligence</span>
+                              {m.streaming && (
+                                <span className="inline-flex items-center gap-1 text-[10.5px] text-accent">
+                                  · synthesizing
+                                </span>
+                              )}
+                            </div>
+                            {(m.retrieval || (m.streaming && retrievalInfo)) && (
+                              <span className="rounded-full border border-line bg-panel-2 px-2 py-0.5 text-[10px] text-dim">
+                                {(m.retrieval || retrievalInfo)!.memories} memories retrieved
+                                {(m.retrieval || retrievalInfo)!.window
+                                  ? ` · ${(m.retrieval || retrievalInfo)!.window}`
+                                  : ""}
+                              </span>
+                            )}
+                          </div>
+
+                          {m.streaming && !displayContent ? (
+                            <div className="flex items-center gap-2.5 py-2 text-[12.5px] text-muted">
+                              <Spinner className="h-4 w-4 shrink-0 text-accent" />
+                              <span>
+                                {retrievalInfo
+                                  ? `Reviewed ${retrievalInfo.memories} memories${
+                                      retrievalInfo.window ? ` from ${retrievalInfo.window}` : ""
+                                    }${
+                                      retrievalInfo.semantic ? " (semantic match)" : ""
+                                    } — structuring insights…`
+                                  : "Searching your memories…"}
+                              </span>
+                            </div>
+                          ) : (
+                            <CompanionMarkdown
+                              content={displayContent}
+                              citations={displayCitations}
+                              onOpenMemory={setOpenMemoryId}
+                            />
+                          )}
+
+                          {m.streaming && displayContent && (
+                            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-dim">
+                              <span className="inline-block h-3 w-[2px] animate-pulse bg-accent" />
+                              <span>Streaming response…</span>
+                            </div>
+                          )}
+
+                          {m.interrupted && (
+                            <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200/90">
+                              Response was interrupted — partial result shown.
+                            </div>
+                          )}
+
+                          {displayCitations.length > 0 && !m.streaming && (
+                            <div className="mt-4 border-t border-line/80 pt-3">
+                              <div className="mb-2 flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-dim">
+                                <BookOpen className="h-3 w-3 text-accent/80" />
+                                <span>Referenced memories ({displayCitations.length})</span>
+                              </div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {displayCitations.map((c, i) => (
+                                  <button
+                                    key={`${c.memoryId}-${i}`}
+                                    type="button"
+                                    onClick={() => setOpenMemoryId(c.memoryId)}
+                                    title={`${c.title} — ${dateLabel(c.date)}${
+                                      c.time ? ` · ${c.time}` : ""
+                                    }`}
+                                    className="group inline-flex max-w-full items-center gap-1.5 rounded-lg border border-line bg-panel-2/90 px-2.5 py-1.5 text-left text-[11.5px] text-muted transition hover:border-accent/45 hover:bg-panel-3 hover:text-fg-strong"
+                                  >
+                                    <BookOpen className="h-3 w-3 shrink-0 text-accent/80 transition group-hover:text-accent" />
+                                    <span className="truncate font-medium text-fg/90 group-hover:text-fg-strong">
+                                      {c.title}
+                                    </span>
+                                    <span className="shrink-0 text-[10.5px] text-dim">
+                                      · {dateLabel(c.date)}
+                                    </span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {m.proposedActions.length > 0 && (
+                            <div className="mt-4 border-t border-line/80 pt-3">
+                              <div className="mb-2 flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-dim">
+                                <ListPlus className="h-3 w-3 text-accent/80" />
+                                <span>Suggested actions</span>
+                              </div>
+                              <div className="space-y-2">
+                                {m.proposedActions.map((pa) => (
+                                  <div
+                                    key={pa.id}
+                                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-accent/25 bg-accent/10 px-3.5 py-2.5"
+                                  >
+                                    <div className="min-w-0 flex-1 text-[12.5px] text-fg">
+                                      <span className="font-medium text-fg-strong">{pa.title}</span>
+                                      {pa.dueDate && (
+                                        <span className="ml-2 inline-flex items-center gap-1 rounded bg-panel-2/80 px-1.5 py-0.5 text-[10.5px] text-muted">
+                                          <Calendar className="h-2.5 w-2.5" />
+                                          {dateLabel(pa.dueDate)}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <button
+                                      onClick={() => void addProposedAction(m.id, pa)}
+                                      disabled={pa.added}
+                                      className={cn(
+                                        "flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition",
+                                        pa.added
+                                          ? "cursor-default bg-emerald-500/10 text-emerald-300"
+                                          : "grad-accent text-white hover:brightness-110"
+                                      )}
+                                    >
+                                      {pa.added ? (
+                                        <>
+                                          <Check className="h-3 w-3" /> Added to Action Center
+                                        </>
+                                      ) : (
+                                        <>
+                                          <ListPlus className="h-3 w-3" /> Add to Action Center
+                                        </>
+                                      )}
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                );
+              })}
+
               <div ref={bottomRef} />
             </div>
           )}
         </div>
 
-        <div className="shrink-0 border-t border-line bg-ink-950/40 px-3 py-3 sm:px-6">
+        <div className="shrink-0 border-t border-line bg-ink-950/55 px-3 py-3 sm:px-6">
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void send(input);
             }}
-            className="mx-auto flex max-w-3xl items-end gap-2"
+            className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border border-line bg-panel-2/90 p-1.5 shadow-sm focus-within:border-accent/50"
           >
             <textarea
+              ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -668,13 +821,13 @@ export default function CompanionPage() {
               }}
               rows={1}
               placeholder="Ask about your memories, commitments, patterns, plans…"
-              className="max-h-36 min-h-[44px] flex-1 resize-none rounded-xl border border-line bg-panel-2 px-4 py-3 text-[13px] text-fg placeholder:text-dim focus:border-accent/50 focus:outline-none"
+              className="max-h-40 min-h-[40px] flex-1 resize-none bg-transparent px-3 py-2 text-[13.5px] leading-relaxed text-fg placeholder:text-dim focus:outline-none"
             />
             {streaming ? (
               <button
                 type="button"
                 onClick={stop}
-                className="flex h-[44px] items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 text-[12px] font-medium text-red-200 transition hover:bg-red-500/20"
+                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3 text-[12px] font-medium text-red-200 transition hover:bg-red-500/20"
               >
                 <StopCircle className="h-4 w-4" /> Stop
               </button>
@@ -682,15 +835,15 @@ export default function CompanionPage() {
               <button
                 type="submit"
                 disabled={!canSend}
-                className="flex h-[44px] w-[44px] items-center justify-center rounded-xl grad-accent text-white transition hover:brightness-110 disabled:opacity-40"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl grad-accent text-white transition hover:brightness-110 disabled:opacity-35"
                 aria-label="Send"
               >
-                <Sparkles className="h-4 w-4" />
+                <ArrowUp className="h-4 w-4" />
               </button>
             )}
           </form>
-          <p className="mx-auto mt-1.5 max-w-3xl text-center text-[10px] text-dim">
-            ECHO answers only from your records — anything unknown is labeled unknown.
+          <p className="mx-auto mt-1.5 max-w-3xl text-center text-[10.5px] text-dim">
+            ECHO cites your captured records directly · Click any source pill to open the original memory
           </p>
         </div>
       </div>
