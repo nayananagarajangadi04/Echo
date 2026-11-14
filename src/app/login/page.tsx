@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { AudioLines, CircleAlert, Lock, Mail, ShieldCheck } from "lucide-react";
-import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { Btn, Spinner, inputCls } from "@/components/ui";
 import { cn } from "@/lib/cn";
 
@@ -58,17 +58,23 @@ function LoginInner() {
   }, [searchParams]);
 
   useEffect(() => {
-    const supabase = createSupabaseBrowserClient();
-    supabase.auth
-      .getUser()
+    let active = true;
+    getSupabaseBrowserClient()
+      .then((supabase) => supabase.auth.getUser())
       .then(({ data }) => {
+        if (!active) return;
         if (data.user) {
           router.replace(nextPath);
         } else {
           setChecking(false);
         }
       })
-      .catch(() => setChecking(false));
+      .catch(() => {
+        if (active) setChecking(false);
+      });
+    return () => {
+      active = false;
+    };
   }, [nextPath, router]);
 
   async function continueWithGoogle() {
@@ -76,7 +82,7 @@ function LoginInner() {
     setError(null);
     setInfo(null);
     try {
-      const supabase = createSupabaseBrowserClient();
+      const supabase = await getSupabaseBrowserClient();
       const callbackUrl = new URL("/auth/callback", window.location.origin);
       if (nextPath !== "/") {
         callbackUrl.searchParams.set("next", nextPath);
@@ -108,7 +114,7 @@ function LoginInner() {
     setError(null);
     setInfo(null);
     try {
-      const supabase = createSupabaseBrowserClient();
+      const supabase = await getSupabaseBrowserClient();
       if (mode === "signin") {
         const { data, error: signInErr } = await supabase.auth.signInWithPassword({
           email: email.trim(),

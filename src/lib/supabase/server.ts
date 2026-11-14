@@ -1,7 +1,7 @@
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { createClient, type SupabaseClient, type User } from "@supabase/supabase-js";
 import { cookies, headers } from "next/headers";
-import { supabasePublishableKey, supabaseUrl } from "../env";
+import { supabasePublishableKey, supabaseServiceRoleKey, supabaseUrl } from "../env";
 
 export class UnauthorizedError extends Error {
   readonly status = 401;
@@ -74,7 +74,7 @@ export async function getAuthenticatedUser(): Promise<{
  */
 export function createSupabaseAdminClient(): SupabaseClient | null {
   const url = supabaseUrl();
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const serviceKey = supabaseServiceRoleKey();
   if (!url || !serviceKey) return null;
   return createClient(url, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
